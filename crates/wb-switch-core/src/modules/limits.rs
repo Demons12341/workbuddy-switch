@@ -14,7 +14,7 @@
 //! 与 CLI 是最近 2 个日期目录，两个 IDE 按文件 mtime 收窗）；重置时刻直接采用日志原文 / payload
 //! 原文给出的官方值，不自建限流窗口模型。
 //!
-//! 六个来源各扫一遍：
+//! 七个来源各扫一遍：
 //!
 //! | 来源 | 日志根 | 格式 | 枚举 | 归因 |
 //! |---|---|---|---|---|
@@ -22,10 +22,17 @@
 //! | CodeBuddy CLI | `~/.codebuddy/logs` | `WorkBuddy` | 日期目录 | 日志内鉴权 uid → 轮换状态文件 |
 //! | CodeBuddy IDE | `<data_dir>/logs` | `Ide` | 会话目录 + mtime | 日志内鉴权 uid → IDE 状态文件 |
 //! | CodeBuddy CN IDE | `<data_dir>/logs` | `Ide` | 会话目录 + mtime | 同上 |
+//! | VS Code（CodeBuddy 扩展） | `%APPDATA%\Code\logs` | `Ide` | 会话目录 + mtime | 日志内鉴权 uid → VS Code 扩展状态文件 |
 //! | 插件宿主 agent 日志 | `CodeBuddyExtension/Logs/<宿主>/<日期>` | `Agent` | 日期目录 | 日志内鉴权 uid → IDE 状态文件 |
 //!
 //! 插件宿主那一路**必须扫**：实测 2026-09-27 的一次 429 只落在它里面（两个 IDE 真身的
 //! exthost 树里没有），早期「它是 IDE 真身的重复记录所以不扫」的结论在当前版本已不成立。
+//!
+//! VS Code 与两个 CodeBuddy IDE **必须对称**：同一个 CodeBuddy 扩展在两个宿主里都写「真身
+//! exthost 日志树 + 插件宿主业务日志」两份记录（实测 2026-09-28 的 429 同时落在这两份里）。
+//! 两个 IDE 的真身树由 `Ide(x)` 覆盖、插件树由 `AgentLog` 覆盖；VS Code 侧若只有 `AgentLog`
+//! 一路，宿主把配额错误只写进真身树时就会整条漏掉（用户实测：IDE 里限流会亮 chip，VS Code
+//! 里限流不亮）。
 //!
 //! 一次返回全部账号的当前受限状态——扫描本身就是全局的，按账号调用会把同一份日志扫 N 遍。
 //!
@@ -47,6 +54,11 @@ use crate::modules::rate_limit_hook::{hook_marker, needs_log_scan, SETTINGS_FILE
 use crate::modules::session::{open_db, table_exists, workbuddy_db_path};
 use crate::modules::variant::WbVariant;
 use crate::modules::vscode_cn_inject::{codebuddy_ide_data_dir, CodeBuddyIdeFlavor};
+use crate::modules::vscode_ext;
+
+/// VS Code 扩展的当前账号状态文件（`vscode_ext.rs` 的写入方）：
+/// 日志内鉴权 uid 取不到时，回落它里面的 `activeAccountId`。
+const VSCODE_EXT_STATE_FILE: &str = "vscode_ext.json";
 
 /// 日志根目录名（档位/IDE 数据根下）。
 const LOG_DIR_NAME: &str = "logs";
@@ -1168,7 +1180,27 @@ fn account_id_by_uid() -> HashMap<String, String> {
         .collect()
 }
 
-/// 新来源（CLI / 两个 IDE）的账号归因。
+/// 归因失败留痕（真实运行路径）。
+///
+/// 「找到了 429 却归不到账号」只有这一条线索：不记下来的话，用户只会看到「限额不亮」，
+/// 无从判断是没扫到还是被丢弃（uid 属于本工具未收录的账号是常见原因之一）。
+#[cfg(not(test))]
+fn record_unattributed(event: &Event) {
+    crate::modules::error_log::record(
+        "backend",
+        "限额事件已在客户端日志中检测到，但无法归因到任何账号（已丢弃该条）",
+        &format!(
+            "uid={:?} model={:?} resetAt={} firstSeenAt={}",
+            event.uid, event.model, event.reset_at, event.first_seen_at
+        ),
+    );
+}
+
+/// 单测不得触碰真实 `~/.wb-switch`（归因失败用例很多，写了会污染用户错误日志）。
+#[cfg(test)]
+fn record_unattributed(_event: &Event) {}
+
+/// 新来源（CLI / 两个 IDE / VS Code）的账号归因。
 ///
 /// ① 事件 uid → 账号库 `uid → id`（日志内鉴权行，时态正确）；② 回落该来源状态文件的
 /// `activeAccountId`（带 `updatedAt ≤ 事件时刻` 门控）；③ 都不满足 → 丢弃该事件，
@@ -1186,7 +1218,11 @@ fn resolve_by_uid(
                 .as_deref()
                 .and_then(|uid| uid_to_account.get(uid))
                 .map(String::as_str)
-                .or_else(|| fallback.account_for(event.first_seen_at))?;
+                .or_else(|| fallback.account_for(event.first_seen_at));
+            let Some(account_id) = account_id else {
+                record_unattributed(event);
+                return None;
+            };
             Some(Resolved {
                 account_id: account_id.to_string(),
                 model: event.model.clone(),
@@ -1303,6 +1339,11 @@ enum ScanSource {
     /// 与 `Ide(x)` 的 exthost 日志树是**两份不同的记录**：本机实测一次 429 只落在这一侧
     /// （两个 IDE 的 exthost 树里没有），所以它必须单独成为一个来源。
     AgentLog,
+    /// VS Code（CodeBuddy 扩展）的真身 exthost 日志树（`%APPDATA%\Code\logs`）。
+    ///
+    /// 与 `Ide(CodeBuddyIdeFlavor::Cn)` 完全同构 —— 同一个扩展、同一套 `LogFormat::Ide`
+    /// 解析与 `AuthMarker::AuthSessionChanged` 归因，只有数据根与回落状态文件不同。
+    VscodeIde,
 }
 
 impl ScanSource {
@@ -1315,6 +1356,7 @@ impl ScanSource {
             Self::Ide(CodeBuddyIdeFlavor::Intl) => 3,
             Self::Ide(CodeBuddyIdeFlavor::Cn) => 4,
             Self::AgentLog => 5,
+            Self::VscodeIde => 6,
         }
     }
 }
@@ -1329,7 +1371,7 @@ impl ScanScope {
     /// 全量来源。生产路径的范围一律由 `scan_scope` 按来源算出（可能正好是它），
     /// 这里保留给缓存超集语义的测试用。
     #[cfg(test)]
-    const ALL: Self = Self(0b11_1111);
+    const ALL: Self = Self(0b111_1111);
 
     fn insert(&mut self, source: ScanSource) {
         self.0 |= 1 << source.bit();
@@ -1353,6 +1395,8 @@ struct ScanRoots {
     ide_sources: Vec<(ScanSource, PathBuf)>,
     /// 插件宿主日志根（`…/CodeBuddyExtension/Logs`）：存在才扫。
     agent_log_root: Option<PathBuf>,
+    /// VS Code 真身日志根（`%APPDATA%\Code\logs`）：存在才扫。
+    vscode_logs_root: Option<PathBuf>,
     /// 本工具 hook 脚本的绝对路径（配置里的 marker）。
     marker: String,
 }
@@ -1384,6 +1428,7 @@ impl ScanRoots {
             hook_sources,
             ide_sources,
             agent_log_root: plugin_host_logs_root(),
+            vscode_logs_root: vscode_ext::vscode_logs_root(),
             marker: hook_marker(),
         }
     }
@@ -1409,12 +1454,13 @@ fn scan_scope(roots: &ScanRoots, scan_ide_logs: bool) -> ScanScope {
             }
         }
         // 插件宿主日志与两个 IDE 共用同一个开关：它本来就是「IDE / 插件宿主」这一侧的记录。
-        if roots
-            .agent_log_root
-            .as_deref()
-            .is_some_and(Path::is_dir)
-        {
+        if roots.agent_log_root.as_deref().is_some_and(Path::is_dir) {
             scope.insert(ScanSource::AgentLog);
+        }
+        // VS Code 真身日志同样属于「IDE 日志」这一侧：与两个 CodeBuddy IDE 对称，
+        // 共用 `scanIdeLogs` 开关（关掉就不会因为 VS Code 而单独扫一遍）。
+        if roots.vscode_logs_root.as_deref().is_some_and(Path::is_dir) {
+            scope.insert(ScanSource::VscodeIde);
         }
     }
     scope
@@ -1538,6 +1584,23 @@ fn scan_sources(scope: ScanScope) -> Vec<Resolved> {
             &ActiveAccount::load(&store_dir().join(state_file)),
         ));
     }
+    // ③b VS Code（CodeBuddy 扩展）的真身 exthost 日志树：与两个 CodeBuddy IDE 完全同构
+    // （同一个扩展、同一套 `Ide` 格式与鉴权行），只是数据根来自 VS Code 用户数据目录、
+    // 回落状态文件是 `vscode_ext.json`。
+    //
+    // 必须扫：同一个扩展在两个宿主里都写「真身树 + 插件宿主业务日志」两份记录，两个 IDE 侧
+    // 分别由 `Ide(x)` 与 `AgentLog` 兜住；VS Code 侧若只剩 `AgentLog`，宿主把配额错误只写进
+    // 真身树时就会整条漏掉。
+    if scope.contains(ScanSource::VscodeIde) {
+        if let Some(root) = vscode_ext::vscode_logs_root() {
+            let events = collect_events(&root, LogFormat::Ide, AuthMarker::AuthSessionChanged);
+            resolved.extend(resolve_by_uid(
+                &events,
+                &account_id_by_uid(),
+                &ActiveAccount::load(&store_dir().join(VSCODE_EXT_STATE_FILE)),
+            ));
+        }
+    }
     // ④ 插件宿主的 agent 业务日志（CN IDE / VS Code 插件共享根）。
     //
     // 早期按 PRD D1「与 CN IDE 真身重复记录同一次 429」而**不扫**，但该结论在当前版本不成立：
@@ -1582,7 +1645,8 @@ fn scan_sources(scope: ScanScope) -> Vec<Resolved> {
 ///
 /// 两条通路合并：
 /// - **hook 通路**（CLI / WorkBuddy 两档位）：事件驱动、实时归因，由 `rate_limit_events` 持有；
-/// - **日志扫描**（两个 IDE 只走这条，受 `scanIdeLogs` 开关约束；CLI / WorkBuddy 只在「该处未注册 hook」时回退扫描）：
+/// - **日志扫描**（两个 IDE 与 VS Code 只走这条，受 `scanIdeLogs` 开关约束；CLI / WorkBuddy 只在
+///   「该处未注册 hook」时回退扫描）：
 ///   按 `SCAN_MIN_INTERVAL_MS` 节流，合并后的 `scannedAt` 是**最近一次真实扫描**的时刻
 ///   （前端据此节流）。
 ///
@@ -1591,7 +1655,7 @@ pub fn get_rate_limits() -> Value {
     let now = now_ms();
     // 限额监听关闭时不再扫日志（hook 信号照常入账，由后端持有）。
     let enabled = crate::modules::rate_limit_events::rate_limit_enabled();
-    // 「扫描 CodeBuddy IDE 日志」是独立开关：关闭后两个 IDE 一律不入 scope，
+    // 「扫描 IDE 日志」是独立开关：关闭后 IDE 侧（两个 IDE + VS Code + 插件宿主）一律不入 scope，
     // CLI / WorkBuddy 的逐来源判定（hook 未接上则回退日志）不受影响。
     let scan_ide_logs = scan_ide_logs_enabled();
     // 逐来源判定：不存在的客户端不参与扫描；已注册 hook 的来源交给事件通路。
@@ -1658,9 +1722,17 @@ mod tests {
             format!("[2026/9/27 13:27:37.182] [Error] [CraftInvokableAgent] [0a2eeed2c4c5ed2f2e2947c1e1fb7616]  Execution failed: {quota}"),
         ]
         .join("\n");
-        let events = dedupe(scan_text(&text, LogFormat::Agent, AuthMarker::AuthSessionChanged));
+        let events = dedupe(scan_text(
+            &text,
+            LogFormat::Agent,
+            AuthMarker::AuthSessionChanged,
+        ));
         assert_eq!(events.len(), 1, "应解析出一次限额事件");
-        assert_eq!(events[0].uid.as_deref(), Some(uid), "账号归因靠日志内鉴权行");
+        assert_eq!(
+            events[0].uid.as_deref(),
+            Some(uid),
+            "账号归因靠日志内鉴权行"
+        );
         // 官方恢复时刻：`2026-09-27 19:03:12 UTC+8` == `11:03:12Z`。
         let expected = NaiveDateTime::parse_from_str("2026-09-27 11:03:12", "%Y-%m-%d %H:%M:%S")
             .expect("合法时间")
@@ -1677,9 +1749,67 @@ mod tests {
             with_session,
         ]
         .join("\n");
-        let events = dedupe(scan_text(&text, LogFormat::Agent, AuthMarker::AuthSessionChanged));
+        let events = dedupe(scan_text(
+            &text,
+            LogFormat::Agent,
+            AuthMarker::AuthSessionChanged,
+        ));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].model.as_deref(), Some("deepseek-v4.1-flash"));
+    }
+
+    /// VS Code 真身日志树（`<数据根>/logs/<会话>/window<N>/exthost/Tencent-Cloud.coding-copilot/*.log`）：
+    /// 与两个 CodeBuddy IDE 同构（`2026-09-28 16:02:56.415 [info] [Tag] …`，含鉴权行与 conversationId），
+    /// 因此可直接复用 `Ide` 格式与 `AuthMarker::AuthSessionChanged` 解析。
+    ///
+    /// 回归：VS Code 侧的这份日志此前**整个源都不在扫描范围**（只有插件宿主业务日志一路），
+    /// 宿主把配额错误只写进真身树时，账号页不会出现限额标记。
+    #[test]
+    fn vscode_ide_log_tree_parses_uid_reset_and_model() {
+        let dir = temp_dir("vscode-ide-logs");
+        // 真实布局：`logs/<会话启动时间戳>/window<N>/exthost/<扩展目录>/腾讯云代码助手.log`。
+        let log_dir = dir
+            .join("logs")
+            .join("20260928T160118")
+            .join("window1")
+            .join("exthost")
+            .join(IDE_LOG_DIR_NAME);
+        std::fs::create_dir_all(&log_dir).expect("VS Code 日志目录");
+        let uid = "254e6601-1fc9-40a2-80d2-8d082e5cecc8";
+        let conversation = "4c568563a8134b4aadc4674519d83e53";
+        let quota = "您的使用量已超出频率限制，将在 2026-09-28 19:11:31 UTC+8 重置，您也可以切换其他模型继续使用。";
+        let text = [
+            format!("2026-09-28 16:02:56.001 [info] [PulseServiceLifecycle] Auth session changed: hasSession=true, initialized=true, uid={uid}"),
+            format!("2026-09-28 16:02:56.100 [info] [ModelSelection] conversationId={conversation}, mode=craft, modelId=deepseek-v4.1-flash, source=user-selected"),
+            format!("2026-09-28 16:02:56.472 [error] [AcpAgent:{conversation}] Agent call failed: {quota}"),
+        ]
+        .join("\n");
+        std::fs::write(log_dir.join("腾讯云代码助手.log"), text).expect("写入 VS Code 日志");
+
+        let events = collect_events(
+            &dir.join("logs"),
+            LogFormat::Ide,
+            AuthMarker::AuthSessionChanged,
+        );
+        assert_eq!(events.len(), 1, "应解析出一次限额事件");
+        assert_eq!(
+            events[0].uid.as_deref(),
+            Some(uid),
+            "账号归因靠日志内鉴权行"
+        );
+        assert_eq!(
+            events[0].model.as_deref(),
+            Some("deepseek-v4.1-flash"),
+            "模型取同会话的会话级映射"
+        );
+        // 官方恢复时刻：`2026-09-28 19:11:31 UTC+8` == `11:11:31Z`。
+        let expected = NaiveDateTime::parse_from_str("2026-09-28 11:11:31", "%Y-%m-%d %H:%M:%S")
+            .expect("合法时间")
+            .and_utc()
+            .timestamp_millis();
+        assert_eq!(events[0].reset_at, expected);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// SDK 会话日志：模型线索来自 `method:sendPrompt`，会话 id 来自文件名。
@@ -3121,6 +3251,7 @@ mod tests {
                 ),
             ],
             agent_log_root: Some(dir.join("CodeBuddyExtension").join("Logs")),
+            vscode_logs_root: Some(dir.join("Code").join("logs")),
             marker: marker.to_string(),
         }
     }
@@ -3163,13 +3294,18 @@ mod tests {
         let wb_cn = dir.join(".workbuddy");
         let ide_intl = dir.join("CodeBuddy");
         let ide_cn = dir.join("CodeBuddy CN");
-        // 已安装：CLI（已注册）、WorkBuddy 国内版（配置里**没有** marker）、两个 IDE。
+        let vscode_logs = dir.join("Code").join("logs");
+        let agent_logs = dir.join("CodeBuddyExtension").join("Logs");
+        // 已安装：CLI（已注册）、WorkBuddy 国内版（配置里**没有** marker）、两个 IDE、
+        // VS Code 真身日志根、插件宿主日志根。
         std::fs::create_dir_all(&cli_root).expect("CLI 数据根");
         std::fs::write(cli_root.join(SETTINGS_FILE_NAME), &registered).expect("CLI 配置");
         std::fs::create_dir_all(&wb_cn).expect("WorkBuddy 数据根");
         std::fs::write(wb_cn.join(SETTINGS_FILE_NAME), "{}").expect("WorkBuddy 配置");
         std::fs::create_dir_all(&ide_intl).expect("IDE 数据根");
         std::fs::create_dir_all(&ide_cn).expect("CN IDE 数据根");
+        std::fs::create_dir_all(&vscode_logs).expect("VS Code 日志根");
+        std::fs::create_dir_all(&agent_logs).expect("插件宿主日志根");
 
         let roots = scan_roots_for(&dir, &marker);
 
@@ -3188,6 +3324,11 @@ mod tests {
         );
         assert!(scope.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Intl)));
         assert!(scope.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Cn)));
+        assert!(
+            scope.contains(ScanSource::VscodeIde),
+            "VS Code 真身日志根存在时与两个 IDE 一视同仁"
+        );
+        assert!(scope.contains(ScanSource::AgentLog));
 
         // 用户手删了 CLI 的条目 → 只有 CLI 回退扫描，其余来源不受影响。
         std::fs::write(cli_root.join(SETTINGS_FILE_NAME), "{}").expect("手删条目");
@@ -3202,7 +3343,7 @@ mod tests {
         std::fs::write(cli_root.join(SETTINGS_FILE_NAME), "{ not json").expect("写坏配置");
         assert!(scan_scope(&roots, true).contains(ScanSource::Cli));
 
-        // 注册齐全 + 数据根都在 → 只剩两个 IDE。
+        // 注册齐全 + 数据根都在 → 只剩 IDE 侧（两个 IDE + VS Code 真身 + 插件宿主）。
         std::fs::write(cli_root.join(SETTINGS_FILE_NAME), &registered).expect("重新注册");
         std::fs::write(wb_cn.join(SETTINGS_FILE_NAME), &registered).expect("注册 WorkBuddy");
         let scope = scan_scope(&roots, true);
@@ -3210,13 +3351,16 @@ mod tests {
         assert!(!scope.contains(ScanSource::WorkBuddy(WbVariant::Cn)));
         assert!(scope.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Intl)));
         assert!(scope.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Cn)));
+        assert!(scope.contains(ScanSource::VscodeIde));
+        assert!(scope.contains(ScanSource::AgentLog));
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `scanIdeLogs = false` **只关两个 IDE**：CLI / WorkBuddy 的逐来源判定完全不变。
+    /// `scanIdeLogs = false` **只关 IDE 这一侧**（两个 IDE + VS Code 真身 + 插件宿主）：
+    /// CLI / WorkBuddy 的逐来源判定完全不变。
     #[test]
-    fn ide_scan_switch_excludes_only_the_two_ide_sources() {
+    fn ide_scan_switch_excludes_only_the_ide_side_sources() {
         let dir = temp_dir("ide-switch");
         let marker = quoted_marker(&dir);
         let registered = registered_settings(&marker);
@@ -3229,13 +3373,21 @@ mod tests {
         std::fs::write(wb_cn.join(SETTINGS_FILE_NAME), "{}").expect("WorkBuddy 配置");
         std::fs::create_dir_all(dir.join("CodeBuddy")).expect("IDE 数据根");
         std::fs::create_dir_all(dir.join("CodeBuddy CN")).expect("CN IDE 数据根");
+        std::fs::create_dir_all(dir.join("Code").join("logs")).expect("VS Code 日志根");
+        std::fs::create_dir_all(dir.join("CodeBuddyExtension").join("Logs"))
+            .expect("插件宿主日志根");
 
         let roots = scan_roots_for(&dir, &marker);
 
-        // 关闭：两个 IDE 一个都不扫；CLI（已注册）仍不扫、WorkBuddy（未注册）仍回退扫描。
+        // 关闭：IDE 侧一个都不扫；CLI（已注册）仍不扫、WorkBuddy（未注册）仍回退扫描。
         let off = scan_scope(&roots, false);
         assert!(!off.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Intl)));
         assert!(!off.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Cn)));
+        assert!(
+            !off.contains(ScanSource::VscodeIde),
+            "VS Code 真身日志与两个 IDE 共用 scanIdeLogs 开关"
+        );
+        assert!(!off.contains(ScanSource::AgentLog));
         assert!(
             !off.contains(ScanSource::Cli),
             "已注册 hook 的判定不因 IDE 开关改变"
@@ -3245,10 +3397,12 @@ mod tests {
             "未接 hook 的档位仍回退日志扫描"
         );
 
-        // 重新开启 → 两个 IDE 回到范围（是关闭时的超集）。
+        // 重新开启 → IDE 侧全部回到范围（是关闭时的超集）。
         let on = scan_scope(&roots, true);
         assert!(on.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Intl)));
         assert!(on.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Cn)));
+        assert!(on.contains(ScanSource::VscodeIde));
+        assert!(on.contains(ScanSource::AgentLog));
         assert!(on.covers(off), "开启是关闭的超集");
 
         std::fs::remove_dir_all(&dir).ok();

@@ -1926,8 +1926,9 @@ function RateLimitCard() {
   }
 
   /**
-   * 「扫描 CodeBuddy IDE 日志」独立开关：只关两个 IDE 的日志来源（IDE 的 429 不触发任何
-   * 事件，日志是它唯一的数据源），CLI / WorkBuddy 的 hook 通路不受影响。
+   * 「扫描 IDE 日志」独立开关：关掉 IDE 侧的全部日志来源（两个 CodeBuddy IDE、VS Code 的
+   * CodeBuddy 扩展真身日志，以及插件宿主的 agent 业务日志）—— 这些客户端的 429 不触发任何
+   * 事件，日志是它们唯一的数据源；CLI / WorkBuddy 的 hook 通路不受影响。
    */
   async function onToggleIdeLogs(scanIdeLogs: boolean) {
     if (!config || busy) return;
@@ -1940,7 +1941,7 @@ function RateLimitCard() {
       toast.success(
         scanIdeLogs
           ? "已开启 IDE 日志扫描"
-          : "已关闭 IDE 日志扫描：两个 CodeBuddy IDE 的限额不再显示",
+          : "已关闭 IDE 日志扫描：CodeBuddy IDE / VS Code 的限额不再显示",
       );
     } catch (e) {
       setConfig(previous);
@@ -1997,11 +1998,11 @@ function RateLimitCard() {
 
   const existingTargets = status?.targets.filter((target) => target.exists) ?? [];
   const installedCount = existingTargets.filter((target) => target.installed).length;
-  // IDE 的限额只有日志一条来源：扫描开关关闭时文案不能再说「仍按日志扫描」。
+  // IDE 侧的限额只有日志一条来源：扫描开关关闭时文案不能再说「仍按日志扫描」。
   const ideNote =
     config?.scanIdeLogs === false
-      ? "CodeBuddy IDE 的日志扫描已关闭"
-      : "CodeBuddy IDE 无事件，仍按日志扫描";
+      ? "CodeBuddy IDE / VS Code 的日志扫描已关闭"
+      : "CodeBuddy IDE / VS Code 无事件，仍按日志扫描";
   const hookDescription = status
     ? existingTargets.length === 0
       ? `未检测到 CodeBuddy CLI / WorkBuddy 客户端：没有可接入的配置（${ideNote}）`
@@ -2031,8 +2032,8 @@ function RateLimitCard() {
         </SettingsFieldRow>
 
         <SettingsFieldRow
-          label="扫描 CodeBuddy IDE 日志"
-          description="IDE 的限额只有日志一条来源，关掉后不再显示；CodeBuddy CLI / WorkBuddy 的实时上报不受影响"
+          label="扫描 IDE 日志"
+          description="CodeBuddy IDE / VS Code 的限额只有日志一条来源，关掉后不再显示；CodeBuddy CLI / WorkBuddy 的实时上报不受影响"
           htmlFor="rl-ide-scan"
           operational
         >
@@ -2041,7 +2042,7 @@ function RateLimitCard() {
             checked={config?.scanIdeLogs ?? true}
             disabled={busy || !config}
             onCheckedChange={(v) => void onToggleIdeLogs(v)}
-            aria-label="扫描 CodeBuddy IDE 日志"
+            aria-label="扫描 IDE 日志"
           />
         </SettingsFieldRow>
 

@@ -1,0 +1,14 @@
+{
+  "build": {
+    "beforeBuildCommand": "node scripts/prepare-agent-companion.mjs copy && npm run build && node scripts/prepare-agent-companion.mjs copy"
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "nsis": {
+        "languages": ["SimpChinese"],
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

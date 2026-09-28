@@ -76,6 +76,20 @@ pub fn vscode_ext_state_db_path() -> Option<PathBuf> {
     state_db_path_for(&VSCODE_TARGET)
 }
 
+/// VS Code 用户数据目录下的**日志根**（`<数据根>/logs`）：CodeBuddy 扩展在 VS Code 侧的真身日志树。
+///
+/// 布局与两个 CodeBuddy IDE 完全同构：
+/// `<数据根>/logs/<会话启动时间戳>/window<N>/exthost/Tencent-Cloud.coding-copilot/*.log`
+/// （行首 `YYYY-MM-DD HH:MM:SS.mmm [level] [Tag] …`，含 `[PulseServiceLifecycle] Auth session
+/// changed: … uid=` 鉴权行与 `conversationId=` / `modelId=` 会话线索），因此限额扫描可以复用
+/// 与两个 IDE 同一套 `LogFormat::Ide` + `AuthMarker::AuthSessionChanged` 解析与归因。
+///
+/// 目录不存在（没装 VS Code / 没用过该扩展）时返回 `None` —— 与其它来源一致：不存在就不扫。
+pub(crate) fn vscode_logs_root() -> Option<PathBuf> {
+    let root = vscode_data_dir()?.join("logs");
+    root.is_dir().then_some(root)
+}
+
 fn state_path() -> PathBuf {
     store_dir().join(STATE_FILE)
 }
@@ -612,10 +626,7 @@ mod win_close {
     /// 对指定 PID 的全部可见窗口发 `SC_CLOSE`（= 点 ✕）；返回命中的窗口数。
     pub(super) fn post_close(pid: u32) -> usize {
         let mut hit = 0;
-        for window in visible_windows()
-            .iter()
-            .filter(|window| window.pid == pid)
-        {
+        for window in visible_windows().iter().filter(|window| window.pid == pid) {
             unsafe {
                 PostMessageW(window.hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
             }
@@ -669,7 +680,8 @@ fn close_timeout_error_windows(
             .collect();
         format!("VS Code 窗口 {} 没有关闭。", named.join("、"))
     };
-    message.push_str("请在 VS Code 中处理保存提示；若你在等待期间重新打开过 VS Code，请退出后重试。");
+    message
+        .push_str("请在 VS Code 中处理保存提示；若你在等待期间重新打开过 VS Code，请退出后重试。");
     if !notes.is_empty() {
         message.push_str(&format!("（关闭请求返回：{}）", notes.join("；")));
     }
@@ -772,7 +784,10 @@ fn close_vscode(pids: &[u32], timeout_secs: i64) -> Result<(), String> {
                 None => notes.push(format!("taskkill {pid}: 未能在超时内执行")),
             }
         }
-        let window_hits: usize = must_wait.iter().map(|pid| win_close::post_close(*pid)).sum();
+        let window_hits: usize = must_wait
+            .iter()
+            .map(|pid| win_close::post_close(*pid))
+            .sum();
         notes.push(format!("已向 {window_hits} 个可见窗口发出关闭请求"));
         // ④ 等待退出；每 10s 对仍可见的窗口重发一次 SC_CLOSE（有些 Electron 应用会吞掉第一次）。
         let deadline = Instant::now() + Duration::from_secs(timeout_secs.max(1) as u64);
@@ -1500,7 +1515,10 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("PID 60680"), "{message}");
-        assert!(message.contains("已向 1 个可见窗口发出关闭请求"), "{message}");
+        assert!(
+            message.contains("已向 1 个可见窗口发出关闭请求"),
+            "{message}"
+        );
         // 没有可见窗口残留（例如只剩语言服务）时退回 PID 列表，不编造窗口名。
         let message = close_timeout_error_windows(&[1, 2], &[], &[]);
         assert!(message.contains("1, 2"), "{message}");
