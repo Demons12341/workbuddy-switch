@@ -375,6 +375,22 @@ fn installed_app_path(app: &str) -> Option<PathBuf> {
     .find(|path| path.join("Contents/Info.plist").is_file())
 }
 
+/// 创建用于「打开 / 激活外部应用」的子命令。
+///
+/// 这些跳转会拉起 `powershell.exe`、`code.cmd`、`rundll32.exe` 等**控制台**程序；
+/// Windows 上不加 `CREATE_NO_WINDOW` 时每次都会闪一个 cmd 黑框（悬浮窗跳转时尤其扎眼）。
+/// macOS / Linux 没有这个标志，直接透传。
+fn spawn_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    command
+}
+
 /// Runs an open command and maps its failure to the message the UI shows.
 fn run_command(command: &mut Command) -> Result<(), String> {
     let output = command.output().map_err(|e| format!("无法调用系统打开服务：{e}"))?;
@@ -398,22 +414,22 @@ fn run_command(command: &mut Command) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn open_vscode_folder(folder: &Path) -> Result<(), String> {
     if let Some(app) = installed_app_path(VSCODE_APP) {
-        if run_command(Command::new("/usr/bin/open").arg("-a").arg(&app).arg(folder)).is_ok() {
+        if run_command(spawn_command("/usr/bin/open").arg("-a").arg(&app).arg(folder)).is_ok() {
             return Ok(());
         }
         let cli = app.join("Contents/Resources/app/bin/code");
-        if cli.is_file() && run_command(Command::new(cli).arg(folder)).is_ok() {
+        if cli.is_file() && run_command(spawn_command(cli).arg(folder)).is_ok() {
             return Ok(());
         }
     }
-    run_command(Command::new("/usr/bin/open").args(["-b", VSCODE_BUNDLE]).arg(folder))
+    run_command(spawn_command("/usr/bin/open").args(["-b", VSCODE_BUNDLE]).arg(folder))
 }
 
 #[cfg(target_os = "macos")]
 fn open_session_target(target: SessionTarget) -> Result<(), String> {
     match target {
         SessionTarget::Link(target) => {
-            let mut command = Command::new("/usr/bin/open");
+            let mut command = spawn_command("/usr/bin/open");
             if let Some((app, bundle)) = app_for_scheme(target.scheme()) {
                 // URL scheme registration can be missing even while the app
                 // is installed/running. Deliver the deep link to the app itself.
@@ -427,12 +443,12 @@ fn open_session_target(target: SessionTarget) -> Result<(), String> {
             run_command(&mut command)
         }
         SessionTarget::App(bundle) => {
-            run_command(Command::new("/usr/bin/open").args(["-b", bundle]))
+            run_command(spawn_command("/usr/bin/open").args(["-b", bundle]))
         }
         SessionTarget::VSCode { session, cwd } => {
             match resolve_vscode_folder(&vscode_history_roots(), &session, cwd.as_deref()) {
                 Some(folder) => open_vscode_folder(&folder),
-                None => run_command(Command::new("/usr/bin/open").args(["-b", VSCODE_BUNDLE])),
+                None => run_command(spawn_command("/usr/bin/open").args(["-b", VSCODE_BUNDLE])),
             }
         }
     }
@@ -469,7 +485,7 @@ fn activate_app(names: &[&str]) -> Result<(), String> {
          if (-not $p) {{ exit 3 }}; \
          (New-Object -ComObject WScript.Shell).AppActivate($p.Id) | Out-Null"
     );
-    let mut command = Command::new("powershell.exe");
+    let mut command = spawn_command("powershell.exe");
     command.args([
         "-NoProfile",
         "-NonInteractive",
@@ -531,7 +547,7 @@ fn open_vscode_folder(folder: &Path) -> Result<(), String> {
     let Some(cli) = vscode_cli() else {
         return Err("未找到 VS Code 命令行（code.cmd），请确认已安装 VS Code".into());
     };
-    if run_command(Command::new(&cli).arg(folder)).is_ok() {
+    if run_command(spawn_command(&cli).arg(folder)).is_ok() {
         return Ok(());
     }
     // CLI 不可用时退回到主程序：VS Code 自己也会解析参数里的目录。
@@ -541,7 +557,7 @@ fn open_vscode_folder(folder: &Path) -> Result<(), String> {
         .map(|root| root.join("Code.exe"))
         .filter(|exe| exe.is_file());
     match exe {
-        Some(exe) => run_command(Command::new(exe).arg(folder)),
+        Some(exe) => run_command(spawn_command(exe).arg(folder)),
         None => Err("未能唤起 VS Code，请打开应用后重试".into()),
     }
 }
@@ -550,7 +566,7 @@ fn open_vscode_folder(folder: &Path) -> Result<(), String> {
 fn open_session_target(target: SessionTarget) -> Result<(), String> {
     match target {
         SessionTarget::Link(target) => run_command(
-            Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", target.as_str()]),
+            spawn_command("rundll32.exe").args(["url.dll,FileProtocolHandler", target.as_str()]),
         ),
         SessionTarget::App(bundle) => {
             let names = windows_app_processes(bundle);
@@ -575,7 +591,7 @@ fn open_session_target(target: SessionTarget) -> Result<(), String> {
     let SessionTarget::Link(target) = target else {
         return Err("当前平台尚不支持仅唤起应用".into());
     };
-    run_command(Command::new("xdg-open").arg(target.as_str()))
+    run_command(spawn_command("xdg-open").arg(target.as_str()))
 }
 
 #[tauri::command]
