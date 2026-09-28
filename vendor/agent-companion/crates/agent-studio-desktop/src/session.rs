@@ -143,6 +143,24 @@ fn vscode_history_roots() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Where the VS Code family archives the plugin's conversations (Windows).
+/// `%APPDATA%\<产品>\User\globalStorage\...` 与 macOS 的 `Library/Application Support`
+/// 是同一个用户数据根目录，只是前缀不同。
+#[cfg(target_os = "windows")]
+fn vscode_history_roots() -> Vec<PathBuf> {
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return Vec::new();
+    };
+    let base = PathBuf::from(appdata);
+    ["Code", "Code - Insiders", "VSCodium", "Cursor", "Windsurf"]
+        .into_iter()
+        .map(|name| {
+            base.join(name)
+                .join("User/globalStorage/tencent-cloud.coding-copilot/genie-history")
+        })
+        .collect()
+}
+
 /// The bucket whose `conversations/<session>` entry exists, or `None` when the
 /// session is not archived under this root. Read-only, and silent on any error.
 fn bucket_for_session(root: &Path, session: &str) -> Option<String> {
@@ -420,12 +438,136 @@ fn open_session_target(target: SessionTarget) -> Result<(), String> {
     }
 }
 
+/// VS Code 系各产品在 Windows 上的进程名（Windows 没有 bundle id）。
+#[cfg(target_os = "windows")]
+const VSCODE_HOST_PROCESSES: [&str; 5] =
+    ["Code", "Code - Insiders", "VSCodium", "Cursor", "Windsurf"];
+
+/// macOS 的 bundle id → Windows 进程名。
+#[cfg(target_os = "windows")]
+fn windows_app_processes(bundle: &str) -> Vec<&'static str> {
+    match bundle {
+        "com.tencent.codebuddycn" => vec!["CodeBuddy CN"],
+        "com.tencent.codebuddy" => vec!["CodeBuddy"],
+        "com.microsoft.VSCode" => VSCODE_HOST_PROCESSES.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+/// 把已运行的应用窗口提到最前。Windows 没有等价的 `open -a`，只能自己找窗口；
+/// `WScript.Shell.AppActivate` 能同时处理还原与前台化。
+#[cfg(target_os = "windows")]
+fn activate_app(names: &[&str]) -> Result<(), String> {
+    let list = names
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$p = Get-Process -Name {list} -ErrorAction SilentlyContinue \
+         | Where-Object {{ $_.MainWindowHandle -ne 0 }} | Select-Object -First 1; \
+         if (-not $p) {{ exit 3 }}; \
+         (New-Object -ComObject WScript.Shell).AppActivate($p.Id) | Out-Null"
+    );
+    let mut command = Command::new("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        &script,
+    ]);
+    run_command(&mut command)
+}
+
+/// VS Code 家族的命令行入口：优先 PATH（用户自己配的安装），其次常见安装位置。
+#[cfg(target_os = "windows")]
+fn vscode_cli() -> Option<PathBuf> {
+    const NAMES: [&str; 5] = [
+        "code.cmd",
+        "code-insiders.cmd",
+        "codium.cmd",
+        "cursor.cmd",
+        "windsurf.cmd",
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in NAMES {
+                let cli = dir.join(name);
+                if cli.is_file() {
+                    return Some(cli);
+                }
+            }
+        }
+    }
+    let mut dirs = Vec::new();
+    for var in ["LOCALAPPDATA", "PROGRAMFILES", "ProgramFiles(x86)"] {
+        let Some(base) = std::env::var_os(var) else {
+            continue;
+        };
+        let base = PathBuf::from(base);
+        for suffix in [
+            "Programs/Microsoft VS Code/bin",
+            "Microsoft VS Code/bin",
+            "Programs/VSCodium/bin",
+            "VSCodium/bin",
+            "Programs/cursor/resources/app/bin",
+            "Programs/Windsurf/bin",
+        ] {
+            dirs.push(base.join(suffix));
+        }
+    }
+    dirs.into_iter()
+        .find_map(|dir| NAMES.iter().map(|name| dir.join(name)).find(|cli| cli.is_file()))
+}
+
+/// 在 VS Code 里打开（或聚焦已打开该目录的）窗口。
+///
+/// 用 CLI 的 `code <folder>` 而**不用** `-r/--reuse-window`：前者在目录已打开时
+/// 聚焦那个窗口、否则新开一个；后者会把当前窗口换成新目录，正是要避免的行为。
+#[cfg(target_os = "windows")]
+fn open_vscode_folder(folder: &Path) -> Result<(), String> {
+    let Some(cli) = vscode_cli() else {
+        return Err("未找到 VS Code 命令行（code.cmd），请确认已安装 VS Code".into());
+    };
+    if run_command(Command::new(&cli).arg(folder)).is_ok() {
+        return Ok(());
+    }
+    // CLI 不可用时退回到主程序：VS Code 自己也会解析参数里的目录。
+    let exe = cli
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("Code.exe"))
+        .filter(|exe| exe.is_file());
+    match exe {
+        Some(exe) => run_command(Command::new(exe).arg(folder)),
+        None => Err("未能唤起 VS Code，请打开应用后重试".into()),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn open_session_target(target: SessionTarget) -> Result<(), String> {
-    let SessionTarget::Link(target) = target else {
-        return Err("当前平台尚不支持仅唤起应用".into());
-    };
-    run_command(Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", target.as_str()]))
+    match target {
+        SessionTarget::Link(target) => run_command(
+            Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", target.as_str()]),
+        ),
+        SessionTarget::App(bundle) => {
+            let names = windows_app_processes(bundle);
+            if names.is_empty() {
+                return Err("不支持的应用".into());
+            }
+            activate_app(&names)
+        }
+        // 插件没有 URI handler，唯一可寻址的是窗口所在的目录；目录解析不出来
+        // （没归档、或路径过长被桶名截断）时至少把 VS Code 窗口提到最前。
+        SessionTarget::VSCode { session, cwd } => {
+            match resolve_vscode_folder(&vscode_history_roots(), &session, cwd.as_deref()) {
+                Some(folder) => open_vscode_folder(&folder),
+                None => activate_app(&VSCODE_HOST_PROCESSES),
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
