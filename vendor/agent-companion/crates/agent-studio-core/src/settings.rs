@@ -10,7 +10,7 @@ pub fn defaults() -> Value {
     if let Some(workbuddy) = sources.get_mut("workbuddy") {
         workbuddy["logWatch"] = json!(true);
     }
-    json!({"version":1,"sources":sources,"monitor":{"avatarStyle":"animal","railVisibleCount":8,"autoDiscover":true,"retentionHours":0.5,"assignment":"auto","seats":["auto","auto","auto","auto","auto","auto","auto","auto"]},"scene":{"light":"day","weather":"clear","lightning":true,"door":false,"ceiling":false,"playing":true,"speed":1,"maxFps":60,"renderResolution":"native","showPerformance":false,"reducedMotion":false,"defaultView":"program"},"notifications":{"desktop":false,"wait":true,"error":true,"done":true,"sound":false},"general":{"mode":"live","rememberView":true},"schedule":{"enabled":false,"start":"09:00","end":"18:00","deferBusy":true}})
+    json!({"version":1,"sources":sources,"monitor":{"avatarStyle":"animal","railVisibleCount":8,"autoDiscover":true,"retentionHours":0.5,"assignment":"auto","seats":["auto","auto","auto","auto","auto","auto","auto","auto"]},"scene":{"light":"day","weather":"clear","lightning":true,"door":false,"ceiling":false,"playing":true,"speed":1,"maxFps":60,"renderResolution":"native","showPerformance":false,"reducedMotion":false,"defaultView":"program"},"notifications":{"desktop":true,"wait":true,"error":true,"done":true,"sound":true},"general":{"mode":"live","rememberView":true},"schedule":{"enabled":false,"start":"09:00","end":"18:00","deferBusy":true}})
 }
 pub fn validate(v: &Value) -> Result<Value, String> {
     let mut d = defaults();

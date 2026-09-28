@@ -33,6 +33,16 @@ git branch -v           # 看看两个分支各在哪
 
 > 每一处改动的**根因、证据、验证结果**都记在 `.codebuddy/memory/2026-09-27.md`，跟随上游更新遇到冲突时，那份文件就是"补丁说明书"。
 
+### 2026-09-28 追加改动
+
+| 主题 | 改动内容 | 主要文件 |
+| --- | --- | --- |
+| **提示音默认开启** | `notifications` 默认值从 `desktop:false / sound:false` 改为 `desktop:true / sound:true`。原来宿主只有在 `desktop=true` 时才收得到告警（`sound` 又跟着告警一起下发），而「悬浮窗设置」页面**并不暴露这两个开关** ⇒ **任何全新安装的机器都不会有提示音，也不弹桌面通知**。 | `vendor/agent-companion/crates/agent-studio-core/src/settings.rs`、`vendor/agent-companion/src/settings-config.js` |
+
+> 只影响**没有** `~/.agent-studio/settings.json` 的机器（全新安装）。已经存在该文件的机器保持原值：
+> 把 `notifications.desktop` 和 `notifications.sound` 改成 `true` 后重启 App 即可（本机已按此写好）。
+> 排查过程见 `.codebuddy/memory/2026-09-28.md`。
+
 ---
 
 ## 三、日常使用
@@ -117,6 +127,10 @@ git rebase origin/main        # 把上游更新垫到你的改动下面
 | 改了 `vendor/agent-companion/src/desktop/*` 但界面没变 | 悬浮栏加载的是**预构建资源包**（`companion/`），需要重新构建并覆盖（见第三节的 `npm run build:desktop`） |
 | `npm ci` 后 vite 报 `Could not load index.html?html-proxy...`，或 rollup 报 `MODULE_NOT_FOUND`（`rollup/dist/native.js`） | **锁文件是作者在 macOS 上生成的**，`npm ci` 在 Windows 上会漏装平台原生包。补一条即可：`npm install --no-save @rollup/rollup-win32-x64-msvc`，然后 `node "node_modules\vite\bin\vite.js" build` |
 | 隐藏的 cmd 里 `npx vite build` 报 `'vite' is not recognized` | 不要用 `npx` / `node_modules\.bin\vite.cmd`（shim 可能不存在）；直接 `node "node_modules\vite\bin\vite.js" build` |
+| `linker link.exe not found` | 本机 Rust 是 `x86_64-pc-windows-msvc`，必须有 MSVC 链接器。已装 VS 2022 Build Tools 到 **`D:\VS2022`**；打包前先 `call "D:\VS2022\VC\Auxiliary\Build\vcvars64.bat"`（或把其 bin 加进 PATH） |
+| `tauri build` 的 beforeBuildCommand 里跑 `build:desktop`，根 vite 报 `[vite:html-inline-proxy] ... No matching HTML proxy module found` | 只在「一条 cmd/npm 链里连着跑」时出现；**把 3 步分开跑就正常**：`node scripts/prepare-agent-companion.mjs build` → `npm run build` → `node scripts/prepare-agent-companion.mjs copy`，然后 `tauri build` 用一个把 `build.beforeBuildCommand` 改掉的 `--config` 文件（避免它重复跑前端）。注意 `copy` 不能漏，否则打出的包没有悬浮栏资源 |
+| 打包时 `Downloading https://github.com/wixtoolset/...` 失败 `timeout: global` | msi 需要 WiX，从 GitHub 下不动。**只出 NSIS 安装包**：配置里 `"bundle":{"targets":["nsis"]}`；本机 NSIS 已有缓存（`%LOCALAPPDATA%\tauri\NSIS`），可直接用 |
+| 打包进程莫名消失（日志停在编译中途） | 别用 `start` 起打包；用独立进程（PowerShell `Start-Process -WindowStyle Hidden`）跑，避免 shell 会话回收把子进程带走 |
 
 ---
 

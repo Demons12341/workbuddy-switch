@@ -6,7 +6,7 @@
 /** @type {readonly SourceId[]} */
 export const SOURCE_IDS=['codex','workbuddy','codebuddy-ide','codeg'];
 /** @returns {Settings} */
-export const defaultSettings=()=>({version:1,sources:/** @type {Record<SourceId, SourceConfig>} */(Object.fromEntries(SOURCE_IDS.map(id=>[id,id==='workbuddy'?{enabled:true,path:'',logWatch:true}:{enabled:true,path:''}]))),monitor:{avatarStyle:'animal',railVisibleCount:8,autoDiscover:true,retentionHours:.5,assignment:'auto',seats:Array(8).fill('auto')},scene:{light:'day',weather:'clear',lightning:true,door:false,ceiling:false,playing:true,speed:1,maxFps:60,renderResolution:'native',showPerformance:false,reducedMotion:false,defaultView:'program'},notifications:{desktop:false,wait:true,error:true,done:true,sound:false},general:{mode:'live',rememberView:true},schedule:{enabled:false,start:'09:00',end:'18:00',deferBusy:true}});
+export const defaultSettings=()=>({version:1,sources:/** @type {Record<SourceId, SourceConfig>} */(Object.fromEntries(SOURCE_IDS.map(id=>[id,id==='workbuddy'?{enabled:true,path:'',logWatch:true}:{enabled:true,path:''}]))),monitor:{avatarStyle:'animal',railVisibleCount:8,autoDiscover:true,retentionHours:.5,assignment:'auto',seats:Array(8).fill('auto')},scene:{light:'day',weather:'clear',lightning:true,door:false,ceiling:false,playing:true,speed:1,maxFps:60,renderResolution:'native',showPerformance:false,reducedMotion:false,defaultView:'program'},notifications:{desktop:true,wait:true,error:true,done:true,sound:true},general:{mode:'live',rememberView:true},schedule:{enabled:false,start:'09:00',end:'18:00',deferBusy:true}});
 /**
  * Validates externally supplied settings JSON (settings file, native command
  * payload, HTTP body). This function is the single place where untyped input
